@@ -338,7 +338,7 @@ class ToolExecutor:
         self.catalog, self.policy, self.cfg = catalog, policy, cfg
         self._pool = ThreadPoolExecutor(max_workers=4)
 
-    def execute(self, name: str, raw_args: str) -> dict:
+    def execute(self, name: str, raw_args: str, deadline: float | None = None) -> dict:
         tool = self.catalog.get(name)
         if tool is None:
             return err("unknown_tool", f"no tool named '{name}'; available: {self.catalog.names()}")
@@ -355,17 +355,32 @@ class ToolExecutor:
 
         # Timeout par outil. Limite honnête : un thread ne se tue pas en Python ;
         # on arrête d'attendre, mais la fonction peut finir en arrière-plan.
+        wait_s = self.cfg.tool_timeout_s
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return err("timeout", "task deadline reached before tool execution")
+            wait_s = min(wait_s, remaining)
         future = self._pool.submit(tool.fn, **args)
         try:
-            out = future.result(timeout=self.cfg.tool_timeout_s)
+            out = future.result(timeout=wait_s)
         except FutureTimeout:
-            return err("timeout", f"tool exceeded {self.cfg.tool_timeout_s}s")
+            future.cancel()  # annule seulement si le travail n’a pas encore démarré
+            return err("timeout", f"tool wait exceeded {wait_s}s; running effects may still complete")
         except PathError as e:
             return err("forbidden_path", str(e))
         except Exception as e:                 # le harnais ne plante jamais à cause d'un outil
             return err("tool_failed", f"{type(e).__name__}: {e}")
-        if not isinstance(out, dict) or "content" not in out:
+        if (not isinstance(out, dict)
+                or not isinstance(out.get("ok"), bool)
+                or not isinstance(out.get("content"), str)
+                or (out.get("ok") is False
+                    and not isinstance(out.get("error_type"), str))):
             return err("tool_failed", "tool returned a malformed result")
+        # Ne conserver que les champs du contrat : extras potentiellement non JSON.
+        out = {key: out[key] for key in ("ok", "content", "error_type") if key in out}
+        if out["ok"]:
+            out.pop("error_type", None)
 
         cap = self.cfg.max_tool_output
         if len(out["content"]) > cap:
@@ -587,6 +602,10 @@ def merge_summary(prev: str, new_lines: list[str], cap: int) -> str:
     return "[... début omis]\n" + tail
 
 
+class ContextBudgetExceeded(ValueError):
+    """La vue minimale dépasse encore le budget ESTIMÉ ; aucun envoi au modèle."""
+
+
 class ContextManager:
     """Un par tâche : retient le résumé et le nombre d'échanges déjà résumés."""
 
@@ -670,6 +689,11 @@ class ContextManager:
         self.stats = {"tokens": cost(view), "budget": cfg.budget_tokens,
                       "summarized_units": self.covered, "shrunk_results": shrunk,
                       "emergency": last_cap is not None}
+        if self.stats["tokens"] > cfg.budget_tokens:
+            raise ContextBudgetExceeded(
+                f"context requires approximately {self.stats['tokens']} tokens, "
+                f"budget is {cfg.budget_tokens}; shorten the request/tool arguments "
+                "or increase the context budget")
         s = self.stats
         if s["summarized_units"] or s["shrunk_results"] or s["emergency"]:
             self.log(f"  [ctx] ~{s['tokens']}/{s['budget']} tok | {s['summarized_units']} échange(s) "
@@ -767,17 +791,26 @@ class TaskRunner:
                            prompt_tokens=tokens[0], completion_tokens=tokens[1])
             return result(status, answer)
 
+        # Une réponse terminale peut être durable alors que task_finished ne l'est pas.
+        if (messages and messages[-1]["role"] == "assistant"
+                and not messages[-1].get("tool_calls")):
+            return finish("done", messages[-1].get("content") or "")
+
+        deadline = start + cfg.timeout_s
         while True:
             # a) solder d'abord les appels d'outils en attente (cas de la reprise)
             for call in pending_calls(messages):
                 name, raw = call["function"]["name"], call["function"]["arguments"]
                 tool, recovered, t0 = self.catalog.get(name), False, time.monotonic()
-                if call["id"] in unknown and self._applied(tool, raw):
+                if time.monotonic() >= deadline:
+                    # Solder le protocole sans lancer les actions restantes.
+                    out = err("timeout", "task deadline reached; tool not executed in this run")
+                elif call["id"] in unknown and self._applied(tool, raw):
                     out, recovered = ok(f"already applied before the interruption: {name}"), True
                     self.log(f"  [resume] {name} déjà appliqué, non rejoué")
                 else:
                     journal.append("tool_started", call_id=call["id"], name=name, arguments=raw)
-                    out = self.executor.execute(name, raw)
+                    out = self.executor.execute(name, raw, deadline=deadline)
                     executed += 1
                     if faults.get("crash_after_exec") == executed:
                         raise SimulatedCrash(f"crash simulé après l'exécution de {name}")
@@ -799,7 +832,16 @@ class TaskRunner:
                 return finish("max_steps")
 
             # c) un tour de modèle sur la VUE (pas sur l'histoire complète)
-            view, t0 = ctx.build(messages), time.monotonic()
+            try:
+                view = ctx.build(messages)
+            except ContextBudgetExceeded as e:
+                journal.append("context_error", error=str(e))
+                return result("error", f"ContextBudgetExceeded: {e}")
+            # Le résumé éventuel a lui aussi consommé du temps.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return finish("timeout")
+            t0 = time.monotonic()
             try:
                 reply = self.model.chat(view, self.catalog.schemas(), remaining)
             except Exception as e:
@@ -876,6 +918,7 @@ class Harness:
                                            f"tok={e.get('usage', {}).get('prompt_tokens', '?')}"
                                            f"/estimé {e.get('ctx_estimate', '?')}"),
                 "model_error": lambda: e["error"],
+                "context_error": lambda: e["error"],
                 "tool_started": lambda: f"{e['name']}({e['arguments']})",
                 "tool_done": lambda: (f"{e['name']} ok={e['ok']}"
                                       + (f" {e['error_type']}" if e.get("error_type") else "")

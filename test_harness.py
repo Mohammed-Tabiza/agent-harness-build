@@ -2,11 +2,28 @@
 
     python -m unittest test_harness -v
 
-Un faux modèle remplace Ollama. On teste les propriétés que le HARNAIS garantit quoi
-que fasse le modèle : chemins, politique, limites, reprise sans doublon, budget de contexte.
-Les évals (evals.py) mesurent, elles, le modèle réel.
+Version 2 : 26 scénarios historiques + régressions + reprise en processus séparés.
+Aucun appel réseau ni SDK requis. Placer ce fichier à côté de harness.py.
+
+Les tests RegressionTests expriment le comportement attendu : ils échouent tant
+que les défauts du harness fourni ne sont pas corrigés. Aucun expectedFailure
+ne masque ces défauts. Les tests LimitsTests documentent les limites actuelles.
+Le budget testé est celui de l'estimateur, pas celui du tokenizer du modèle.
+Les arrêts os._exit simulent une mort de processus, pas une coupure électrique.
+
+Commandes ciblées :
+    python -m unittest test_harness.RegressionTests -v
+    python -m unittest test_harness.ProcessRecoveryTests -v
+
+Le scénario historique big_file conserve un état de callback en mémoire ;
+les scénarios ProcessRecoveryTests vérifient séparément le redémarrage réel.
 """
 import json
+import os
+import subprocess
+import sys
+import threading
+from unittest.mock import patch
 import re
 import tempfile
 import time
@@ -51,7 +68,7 @@ class ScriptedModel:
 
 
 class FnModel:
-    """Décide à chaque appel à partir de la VUE reçue (comme un vrai modèle sans état)."""
+    """Modèle piloté par callback ; le callback peut conserver un état de test."""
     def __init__(self, fn):
         self.fn, self.calls, self.views = fn, 0, []
 
@@ -75,6 +92,7 @@ class Base(unittest.TestCase):
                       run_cfg=run_cfg or H.RunConfig(), ctx_cfg=ctx_cfg or H.ContextConfig(),
                       policy=policy or H.Policy.permissive(), log=lambda s: None)
         (h.workspace.root / "a.txt").write_text("hello", encoding="utf-8")
+        self.addCleanup(h.executor._pool.shutdown, wait=True)
         return h
 
     def journal_events(self, h, task_id):
@@ -377,7 +395,7 @@ class ContextTests(Base):
         secs = [f"Section {k}. " + " ".join(rng_words[(k * j) % 8] for j in range(130))
                 + (f" Réf : {codes[k]}." if k in codes else "") for k in range(1, 25)]
         (h.workspace.root / "big.txt").write_text("\n\n".join(secs), encoding="utf-8")
-        size = (h.workspace.root / "big.txt").stat().st_size
+        size = len((h.workspace.root / "big.txt").read_text(encoding="utf-8"))
         self.assertGreater(size, 15000)
 
         state = {"next": 0, "n": 0}
@@ -420,6 +438,178 @@ class ContextTests(Base):
             self.assertLessEqual(overhead + sum(H.est_tokens(m, 3.5) for m in v), 1800)
         done = [e for e in self.journal_events(h, r.task_id) if e["type"] == "tool_done"]
         self.assertGreaterEqual(len(done), 30)                 # le journal a tout gardé
+
+
+
+
+# --- régressions : exigences, sans masquage des défauts ----------------------
+
+class RegressionTests(Base):
+    def assert_malformed_rejected(self, payload):
+        h = self.make()
+        h.catalog.register(H.Tool("malformed", "test", lambda: payload))
+        try:
+            out = h.executor.execute("malformed", "{}")
+        except Exception as exc:
+            self.fail(f"Exception non structurée : {type(exc).__name__}: {exc}")
+        self.assertIs(out.get("ok"), False, out)
+        self.assertEqual(out.get("error_type"), "tool_failed", out)
+        self.assertIsInstance(out.get("content"), str)
+
+    def test_missing_ok_is_rejected(self):
+        self.assert_malformed_rejected({"content": "x"})
+
+    def test_non_string_content_is_rejected(self):
+        self.assert_malformed_rejected({"ok": True, "content": None})
+
+    def test_non_boolean_ok_is_rejected(self):
+        self.assert_malformed_rejected({"ok": "yes", "content": "x"})
+
+    def assert_context_not_sent_over_budget(self, messages):
+        # Contrat : produire une vue sous budget OU refuser explicitement.
+        # Une erreur accidentelle (TypeError, KeyError...) ne compte pas comme refus.
+        cm = H.ContextManager(H.ContextConfig(budget_tokens=200), [], log=lambda s: None)
+        try:
+            view = cm.build(messages)
+        except Exception as exc:
+            self.assertIn(type(exc).__name__, {"ContextBudgetExceeded", "ContextBudgetError"},
+                          f"Refus attendu via une exception métier explicite, reçu : {exc!r}")
+            return
+        cost = cm.overhead + sum(H.est_tokens(m, cm.cfg.chars_per_token) for m in view)
+        self.assertLessEqual(cost, 200, "Une vue impossible à réduire doit être refusée")
+
+    def test_oversized_goal_is_rejected_or_fits(self):
+        self.assert_context_not_sent_over_budget([
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "x" * 5000}])
+
+    def test_oversized_tool_arguments_are_rejected_or_fit(self):
+        self.assert_context_not_sent_over_budget([
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "GO"},
+            act(call(1, "write_file", {"filename": "a", "content": "x" * 5000})),
+            tmsg(1, "written")])
+
+    def test_final_response_recovered_without_model_call(self):
+        h = self.make(ScriptedModel([say("réponse originale")]))
+        with self.assertRaises(H.SimulatedCrash):
+            h.run("question", faults={"crash_after_model": 1})
+        h.model = ScriptedModel([say("réponse indésirable")])
+        result = h.resume(h.last_task_id)
+        self.assertEqual(h.model.calls, 0, "La réponse finale existe déjà dans le journal")
+        self.assertEqual((result.status, result.answer), ("done", "réponse originale"))
+
+    def test_deadline_checked_before_each_pending_tool(self):
+        # Horloge contrôlée : aucun seuil de performance ni sleep fragile.
+        clock, effects = [0.0], []
+        h = self.make(ScriptedModel([
+            act(call(1, "first", {}), call(2, "second", {}))]),
+            run_cfg=H.RunConfig(timeout_s=1))
+        def first():
+            effects.append("first")
+            clock[0] = 2.0
+            return H.ok("done")
+        h.catalog.register(H.Tool("first", "test", first))
+        h.catalog.register(H.Tool("second", "test", lambda: (effects.append("second"), H.ok("done"))[1]))
+        with patch.object(H.time, "monotonic", side_effect=lambda: clock[0]):
+            result = h.run("go")
+        self.assertEqual(result.status, "timeout")
+        self.assertEqual(effects, ["first"], "Un nouvel outil démarre après la deadline")
+
+
+class LimitsTests(Base):
+    def test_thread_timeout_does_not_cancel_running_effect(self):
+        """Caractérisation de l'exécuteur à threads, pas une garantie d'annulation."""
+        h = self.make(run_cfg=H.RunConfig(tool_timeout_s=0.05))
+        started, release, completed = threading.Event(), threading.Event(), threading.Event()
+        path = h.workspace.root / "late.txt"
+        def delayed_write():
+            started.set()
+            if not release.wait(5):
+                return H.err("test_timeout", "test did not release worker")
+            path.write_text("late", encoding="utf-8")
+            completed.set()
+            return H.ok("written")
+        h.catalog.register(H.Tool("delayed", "test", delayed_write, permission="write"))
+        try:
+            out = h.executor.execute("delayed", "{}")
+            self.assertTrue(started.wait(2))
+            self.assertEqual(out["error_type"], "timeout")
+            self.assertFalse(path.exists())
+        finally:
+            release.set()
+        self.assertTrue(completed.wait(2))
+        self.assertEqual(path.read_text(encoding="utf-8"), "late")
+
+
+# Exécuté dans deux interpréteurs indépendants. Aucun ScriptedModel ni dictionnaire
+# de progression n'est transmis du processus interrompu au processus de reprise.
+PROCESS_WORKER = r'''
+import json, os, sys
+from pathlib import Path
+import harness as H
+root, phase, crash_point = sys.argv[1:]
+class Model:
+    def __init__(self): self.calls = 0
+    def chat(self, messages, tools=None, timeout=60):
+        self.calls += 1
+        if phase == "crash":
+            message = {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "append-1", "type": "function", "function": {
+                    "name": "append_file", "arguments": json.dumps({
+                        "filename": "notes.md", "content": "UNIQUE-MARKER"})}}]}
+        else:
+            assert messages[-1]["role"] == "tool", "Appel en attente non soldé"
+            assert json.loads(messages[-1]["content"])["ok"] is True
+            message = {"role": "assistant", "content": "reprise terminée"}
+        return H.ModelReply(message, {"prompt_tokens": 0, "completion_tokens": 0})
+model = Model()
+h = H.Harness(root, model=model, policy=H.Policy.permissive(), log=lambda s: None)
+if phase == "crash":
+    try:
+        h._runner().start("ajoute une ligne", task_id="process-test", faults={crash_point: 1})
+    except H.SimulatedCrash:
+        os._exit(73)
+    raise AssertionError("Crash attendu non déclenché")
+else:
+    result = h.resume("process-test")
+    print(json.dumps({"status": result.status, "answer": result.answer,
+                      "calls": model.calls, "events": h.store.journal("process-test").read()}))
+    h.executor._pool.shutdown(wait=True)
+'''
+
+
+class ProcessRecoveryTests(unittest.TestCase):
+    def check_restart(self, crash_point, before_exists):
+        with tempfile.TemporaryDirectory() as root:
+            env = dict(os.environ)
+            module_dir = str(Path(H.__file__).resolve().parent)
+            env["PYTHONPATH"] = module_dir + os.pathsep + env.get("PYTHONPATH", "")
+            def launch(phase):
+                return subprocess.run(
+                    [sys.executable, "-c", PROCESS_WORKER, root, phase, crash_point],
+                    cwd=module_dir, env=env, capture_output=True, text=True,
+                    encoding="utf-8", timeout=15)
+            crashed = launch("crash")
+            self.assertEqual(crashed.returncode, 73, crashed.stdout + crashed.stderr)
+            notes = Path(root) / "workspace" / "notes.md"
+            self.assertEqual(notes.exists(), before_exists)
+            resumed = launch("resume")
+            self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+            data = json.loads(resumed.stdout)
+            self.assertEqual((data["status"], data["answer"], data["calls"]),
+                             ("done", "reprise terminée", 1))
+            self.assertEqual(notes.read_text(encoding="utf-8").splitlines(), ["UNIQUE-MARKER"])
+            dones = [e for e in data["events"] if e["type"] == "tool_done"]
+            self.assertEqual(len(dones), 1)
+            self.assertEqual(dones[0]["recovered"], before_exists)
+            self.assertEqual(data["events"][-1]["type"], "task_finished")
+
+    def test_process_restart_after_model_before_tool(self):
+        self.check_restart("crash_after_model", False)
+
+    def test_process_restart_after_effect_before_tool_done(self):
+        self.check_restart("crash_after_exec", True)
 
 
 if __name__ == "__main__":
